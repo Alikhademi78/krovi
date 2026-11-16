@@ -33,7 +33,7 @@ sha2 = "0.10"
 base64 = "0.22"
 
 ureq = { version = "2", optional = true }
-tungstenite = { version = "0.26", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
+tungstenite = { version = "0.26", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"], optional = true }
 
 [[example]]
 name = "net_probe"
