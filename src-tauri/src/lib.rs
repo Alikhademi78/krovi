@@ -17,6 +17,7 @@ mod commands;
 mod dictation;
 mod explain;
 mod extras;
+mod gemini_live;
 mod live;
 mod reminders;
 mod shell;
@@ -39,6 +40,7 @@ pub fn run() {
             reminders::setup(app)?;
             explain::setup(app)?;
             dictation::setup(app)?;
+            gemini_live::setup(app)?;
             clean::setup(app)?;
             ai::setup(app)?;
             circle::setup(app)?;
@@ -124,6 +126,12 @@ pub fn run() {
             dictation::voice_model_download,
             dictation::voice_model_cancel_download,
             dictation::voice_model_delete,
+            // [gemini_live] - real-time Gemini Live voice in Agent Mode
+            gemini_live::gemini_live_catalog,
+            gemini_live::gemini_live_status,
+            gemini_live::gemini_live_start,
+            gemini_live::gemini_live_stop,
+            gemini_live::gemini_live_send_text,
             // [live] — owner: live-data
             commands::load_clipboard,
             commands::add_clip,

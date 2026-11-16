@@ -218,6 +218,15 @@ impl Recorder {
             .unwrap_or_default()
     }
 
+    /// Drain newly captured 16 kHz mono 16-bit PCM samples since the previous call.
+    /// Keeps buffer memory bounded during long live-streaming sessions.
+    pub fn drain_pcm16(&self) -> Vec<i16> {
+        self.samples
+            .lock()
+            .map(|mut s| std::mem::take(&mut *s))
+            .unwrap_or_default()
+    }
+
     /// Whether the worker ended on its own (device lost or the length cap hit).
     pub fn finished(&self) -> bool {
         self.worker.as_ref().is_none_or(|w| w.is_finished())
