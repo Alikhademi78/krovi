@@ -5,7 +5,17 @@
   import State from './State.svelte';
   import AgentConfirmCard from './AgentConfirmCard.svelte';
   import { mode } from '../lib/bridge';
-  import { pushToast } from '../lib/stores';
+  import { activeTool, pushToast } from '../lib/stores';
+  import { dictationInfo, loadDictation, meterLevel, saveDictationSettings } from '../lib/dictation';
+  import {
+    clearGeminiLiveTurns,
+    geminiLiveState,
+    geminiLiveTurns,
+    loadGeminiLiveStatus,
+    sendGeminiLiveText,
+    startGeminiLive,
+    stopGeminiLive,
+  } from '../lib/geminiLive';
   import {
     EXAMPLES,
     agent,
@@ -61,12 +71,57 @@
   };
   const waiting = $derived(tasks.filter((t) => t.status.state === 'awaiting-confirmation' || t.status.state === 'pending'));
 
+  const di = $derived($dictationInfo);
+  const ds = $derived(di.settings);
+  const live = $derived($geminiLiveState);
+  const liveTurns = $derived($geminiLiveTurns);
+  const isGeminiLive = $derived(ds.agentEngine === 'gemini-live');
+  let liveBusy = $state(false);
+
+  async function toggleGeminiLive() {
+    if (liveBusy) return;
+    liveBusy = true;
+    error = '';
+    try {
+      if (live.sessionActive) {
+        await stopGeminiLive();
+      } else {
+        await startGeminiLive();
+      }
+    } catch (err) {
+      error = message(err);
+    } finally {
+      liveBusy = false;
+    }
+  }
+
+  async function toggleAgentShortcut() {
+    if (demo) return;
+    try {
+      await saveDictationSettings({ ...ds, agentEnabled: !ds.agentEnabled });
+      pushToast(!ds.agentEnabled ? `Agent shortcut (${ds.agentShortcut}) enabled.` : 'Agent shortcut paused.', 2200);
+    } catch (err) {
+      error = message(err);
+    }
+  }
+
   async function submit(e: SubmitEvent) {
     e.preventDefault();
     const asked = text.trim();
     if (!asked || busy) return;
     busy = true;
     error = '';
+    if (isGeminiLive && live.sessionActive) {
+      try {
+        await sendGeminiLiveText(asked);
+        text = '';
+      } catch (err) {
+        error = message(err);
+      } finally {
+        busy = false;
+      }
+      return;
+    }
     heard = '';
     clearVoicePlan(); // a typed sentence replaces the spoken one
     try {
@@ -168,6 +223,8 @@
   }
 
   onMount(() => {
+    void loadDictation().catch(() => {});
+    void loadGeminiLiveStatus().catch(() => {});
     void startAgent(); // so a "set a timer" step starts a real timer, and a spoken command reaches us
     agent.warm(); // read the Start-menu app list now, so "open spotify" is quick
     void agent.tasks().then((t) => (tasks = t)).catch(() => {});
@@ -197,7 +254,7 @@
     <input
       class="input"
       type="text"
-      placeholder="Tell Krovi what to do"
+      placeholder={isGeminiLive && live.sessionActive ? 'Message Gemini Live (or keep speaking)' : 'Tell Krovi what to do'}
       aria-label="Tell Krovi what to do"
       maxlength="500"
       autocomplete="off"
@@ -213,6 +270,71 @@
     {#if demo}
       <p class="demo faint"><Icon name="info" size={13} /> Preview: links, apps and email drafts are not opened here. Timers, notes and reminders do work.</p>
     {/if}
+    {#if isGeminiLive}
+      <section class="live-card card" aria-label="Gemini Live voice">
+        <div class="live-head">
+          <div class="live-title">
+            <span class="live-badge" class:on={live.sessionActive}>
+              <Icon name="mic" size={13} />
+              {live.sessionActive ? (live.phase === 'speaking' ? 'Gemini speaking' : live.phase === 'thinking' ? 'Gemini thinking' : live.phase === 'connecting' ? 'Connecting...' : 'Live voice on') : 'Gemini Live'}
+            </span>
+            <span class="faint live-meta">{live.model} ? {live.voice}</span>
+          </div>
+          <div class="live-acts">
+            {#if !demo}
+              <button
+                class="btn sm"
+                type="button"
+                onclick={toggleAgentShortcut}
+                title="Toggle global shortcut in Settings ? Dictation">
+                {ds.agentEnabled ? `${ds.agentShortcut} On` : `Enable ${ds.agentShortcut}`}
+              </button>
+            {/if}
+            <button
+              class="btn sm {live.sessionActive ? 'danger' : 'primary'}"
+              type="button"
+              disabled={liveBusy || (!demo && !live.ready && !live.sessionActive)}
+              onclick={toggleGeminiLive}>
+              <Icon name={live.sessionActive ? 'close' : 'mic'} size={13} />
+              {live.sessionActive ? 'Stop Live' : 'Talk Live'}
+            </button>
+          </div>
+        </div>
+
+        {#if live.sessionActive && live.phase === 'listening'}
+          <div class="live-meter" aria-hidden="true"><i style:transform="scaleX({meterLevel(live.level)})"></i></div>
+        {/if}
+
+        {#if !demo && !live.ready}
+          <div class="live-setup">
+            <span><Icon name="info" size={13} /> {live.readinessError ?? 'Set up your Gemini API key and accept the Gemini notice in Settings ? AI.'}</span>
+            <button class="btn sm" type="button" onclick={() => activeTool.set('settings')}>Open Settings</button>
+          </div>
+        {/if}
+
+        {#if live.error}
+          <p class="error" role="alert"><Icon name="alert" size={14} /> {live.error}</p>
+        {/if}
+
+        {#if liveTurns.length}
+          <div class="live-chat">
+            <div class="live-chat-head">
+              <span class="faint">Conversation</span>
+              <button class="btn sm ghost" type="button" onclick={clearGeminiLiveTurns}>Clear</button>
+            </div>
+            <ul class="turns">
+              {#each liveTurns as t (t.id)}
+                <li class="turn" class:user={t.role === 'user'} dir="auto">
+                  <span class="who">{t.role === 'user' ? 'You' : 'Gemini'}</span>
+                  <span class="msg">{t.text}</span>
+                </li>
+              {/each}
+            </ul>
+          </div>
+        {/if}
+      </section>
+    {/if}
+
     {#if error}
       <p class="error" role="alert"><Icon name="alert" size={14} /> {error}</p>
     {/if}
@@ -648,5 +770,121 @@
   .actions {
     display: flex;
     justify-content: flex-end;
+  }
+  .live-card {
+    padding: 12px;
+    display: grid;
+    gap: 10px;
+  }
+  .live-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .live-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+  .live-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--t-xs);
+    font-weight: 600;
+    padding: 3px 9px;
+    border-radius: 999px;
+    background: var(--s2);
+    color: var(--text-2);
+  }
+  .live-badge.on {
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+  .live-meta {
+    font-size: var(--t-xs);
+  }
+  .live-acts {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .live-meter {
+    height: 4px;
+    border-radius: 999px;
+    background: var(--s2);
+    overflow: hidden;
+  }
+  .live-meter i {
+    display: block;
+    height: 100%;
+    background: var(--accent);
+    transform-origin: left center;
+    transition: transform 60ms linear;
+  }
+  .live-setup {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: var(--t-xs);
+    color: var(--text-2);
+    background: var(--s2);
+    padding: 8px 10px;
+    border-radius: var(--r-sm);
+  }
+  .live-setup span {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .live-chat {
+    display: grid;
+    gap: 6px;
+    border-top: 1px solid var(--border);
+    padding-top: 8px;
+  }
+  .live-chat-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: var(--t-xs);
+  }
+  .turns {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 6px;
+    max-height: 190px;
+    overflow-y: auto;
+  }
+  .turn {
+    display: grid;
+    gap: 2px;
+    padding: 7px 10px;
+    border-radius: var(--r-sm);
+    background: var(--s2);
+    font-size: var(--t-sm);
+  }
+  .turn.user {
+    background: var(--accent-soft);
+  }
+  .turn .who {
+    font-size: var(--t-xs);
+    font-weight: 600;
+    color: var(--text-2);
+  }
+  .turn .msg {
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+  }
+  .btn.danger {
+    background: var(--danger);
+    color: #fff;
   }
 </style>

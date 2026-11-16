@@ -14,6 +14,7 @@
   import { clips, media, pulse, stats } from '../lib/live';
   import { startVoice, stopVoice, voiceAvailability, voiceState } from '../lib/voice';
   import { cancelDictation, dictationLive, dismissNotice, pillFace, setDictationToaster, wireDictation } from '../lib/dictation';
+  import { dismissGeminiLiveError, geminiLiveState, geminiPillFace, stopGeminiLive, wireGeminiLive } from '../lib/geminiLive';
   import { isIdle, markActivity } from '../lib/idle';
   import { awareState, awareStop } from '../lib/circle';
   import IdleCompanion from './idle/IdleCompanion.svelte';
@@ -83,7 +84,8 @@
   let micFocus = $state(false);
   // Global dictation (local Whisper) takes over the pill while it listens or works. Its one button
   // sits where the mic button would be: cancel while it runs, Copy when typing was blocked.
-  const dface = $derived(pillFace($dictationLive));
+  const gface = $derived(geminiPillFace($geminiLiveState));
+  const dface = $derived(gface ?? pillFace($dictationLive));
   const dictAction: 'cancel' | 'copy' | null = $derived(!dface ? null : dface.kind !== 'notice' ? 'cancel' : dface.copy ? 'copy' : null);
   const dictKey = $derived(!dface ? '' : dface.kind === 'notice' ? `n:${dface.label}` : dface.kind);
   const dictSay = $derived(!dface ? '' : dface.kind === 'notice' ? `${dface.label}. ${dface.detail}`.trim() : dface.label);
@@ -303,6 +305,7 @@
   onMount(() => {
     void voiceAvailability().then((a) => (micOk = a.commands));
     void wireDictation();
+    void wireGeminiLive();
     setDictationToaster(pushToast);
     const offIntent = onIntent(act);
     const offShell = onShellRequest((a) => act(a));
@@ -439,7 +442,14 @@
               style:top="{(psize.h - 26) / 2}px"
               aria-label="Cancel dictation"
               title="Cancel dictation. Nothing is typed."
-              onclick={() => void cancelDictation()}>
+              onclick={() => {
+                if (gface) {
+                  dismissGeminiLiveError();
+                  void stopGeminiLive();
+                } else {
+                  void cancelDictation();
+                }
+              }}>
               <Icon name="close" size={13} />
             </button>
           {:else if dictAction === 'copy'}
