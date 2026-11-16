@@ -14,7 +14,7 @@ publish = false
 # compile the HTTP client (ureq + rustls, a pure-Rust TLS stack with no OpenSSL
 # C dependency); that path is only built/run in CI on a full toolchain.
 default = []
-net = ["dep:ureq"]
+net = ["dep:ureq", "dep:tungstenite"]
 
 [dependencies]
 # Pure Rust, compiles everywhere. Used to deserialize API responses into typed
@@ -30,7 +30,10 @@ sha2 = "0.10"
 # Optional, CI-only: a minimal HTTP client using the pure-Rust rustls TLS stack
 # (avoids the OpenSSL C dependency). Off by default so the pure logic above
 # always builds and tests locally even without a 64-bit C compiler.
+base64 = "0.22"
+
 ureq = { version = "2", optional = true }
+tungstenite = { version = "0.26", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
 
 [[example]]
 name = "net_probe"
