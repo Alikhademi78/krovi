@@ -49,6 +49,7 @@ pub mod ai;
 pub mod ai_settings;
 mod cache;
 pub mod currency;
+pub mod gemini_live;
 pub mod geocode;
 pub mod reply;
 pub mod resolve;

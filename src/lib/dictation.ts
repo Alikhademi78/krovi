@@ -17,6 +17,7 @@ import { invoke, isTauri, listen } from './bridge';
 // ---------------------------------------------------------------------------------------------
 
 export type TalkMode = 'hold' | 'toggle';
+export type AgentVoiceEngine = 'gemini-live' | 'local';
 export type DictationStyle = 'plain' | 'message' | 'email' | 'note' | 'code' | 'professional' | 'casual';
 
 export interface Replacement {
@@ -48,6 +49,14 @@ export interface DictationSettings {
   agentEnabled: boolean;
   /** e.g. "Ctrl+Alt+A". Follows the same hold / toggle choice as dictation. */
   agentShortcut: string;
+  /** What handles Talk to Agent: live Gemini voice ("gemini-live") or local Whisper ("local"). */
+  agentEngine: AgentVoiceEngine;
+  /** Gemini Live model id (e.g. "gemini-3.8-live"). */
+  geminiLiveModel: string;
+  /** Gemini Live prebuilt voice name (e.g. "Puck", "Aoede", "Kore"). */
+  geminiLiveVoice: string;
+  /** Optional system instructions for Gemini Live sessions. */
+  geminiLiveSystemPrompt: string;
 }
 
 export type ModelStatus = { state: 'installed'; path: string; bytes: number } | { state: 'missing' } | { state: 'partial' };
@@ -162,6 +171,10 @@ export const DEFAULT_DICTATION_SETTINGS: DictationSettings = {
   options: { style: 'plain', replacements: [], remove_fillers: true, auto_punctuate: true },
   agentEnabled: false,
   agentShortcut: 'Ctrl+Alt+A',
+  agentEngine: 'gemini-live',
+  geminiLiveModel: 'gemini-3.8-live',
+  geminiLiveVoice: 'Puck',
+  geminiLiveSystemPrompt: '',
 };
 
 const STYLE_IDS = DICTATION_STYLES.map((s) => s.id);
@@ -201,6 +214,10 @@ export function normalizeDictationSettings(raw: unknown): DictationSettings {
     },
     agentEnabled: bool(r.agentEnabled, d.agentEnabled),
     agentShortcut: str(r.agentShortcut, d.agentShortcut),
+    agentEngine: r.agentEngine === 'local' || r.agentEngine === 'gemini-live' ? r.agentEngine : d.agentEngine,
+    geminiLiveModel: str(r.geminiLiveModel, d.geminiLiveModel).trim() || d.geminiLiveModel,
+    geminiLiveVoice: str(r.geminiLiveVoice, d.geminiLiveVoice).trim() || d.geminiLiveVoice,
+    geminiLiveSystemPrompt: str(r.geminiLiveSystemPrompt, d.geminiLiveSystemPrompt),
   };
 }
 

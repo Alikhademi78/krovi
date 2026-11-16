@@ -54,8 +54,15 @@
     type InputDevice,
     type MicTest,
     type Replacement,
+    type AgentVoiceEngine,
     type TalkMode,
   } from '../lib/dictation';
+  import {
+    geminiLiveCatalog,
+    geminiLiveState,
+    loadGeminiLiveCatalog,
+    loadGeminiLiveStatus,
+  } from '../lib/geminiLive';
   import {
     DEFAULT_SETTINGS as DEFAULT_READ_ALOUD,
     RATE_MAX,
@@ -212,6 +219,8 @@
     dStatus = 'loading';
     try {
       await loadDictation();
+      void loadGeminiLiveCatalog().catch(() => {});
+      void loadGeminiLiveStatus().catch(() => {});
       dStatus = 'ready';
       void loadDevices();
     } catch {
@@ -813,11 +822,64 @@
             <div class="field">
               <div class="lab">
                 <strong>Talk to Agent</strong>
-                <span class="faint">Hold the Agent shortcut and say what you want, like “open YouTube” or “set a timer for ten minutes”. It isn’t typed anywhere: it becomes a plan in Agent, where safe steps run and anything else waits for your OK.</span>
+                <span class="faint">{ds.agentEngine === 'gemini-live' ? 'Talk live with Gemini over voice using the Agent shortcut ? no Whisper download needed.' : 'Hold the Agent shortcut and say what you want, like ?open YouTube? or ?set a timer for ten minutes?. It becomes a local plan in Agent.'}</span>
               </div>
               <Toggle label="Talk to Agent" checked={ds.agentEnabled} onchange={(v) => saveDict({ ...ds, agentEnabled: v }, 'agent')} />
             </div>
-            {#if ds.agentEnabled && !modelReady}
+            <div class="field">
+              <div class="lab">
+                <strong>Agent voice engine</strong>
+                <span class="faint">{ds.agentEngine === 'gemini-live' ? 'Real-time two-way voice conversation with Gemini Live.' : 'Offline local Whisper speech recognition + rule-based Agent commands.'}</span>
+              </div>
+              <Segmented
+                label="Agent voice engine"
+                size="sm"
+                value={ds.agentEngine}
+                options={[
+                  { id: 'gemini-live', label: 'Gemini Live' },
+                  { id: 'local', label: 'Local (Whisper)' },
+                ]}
+                onchange={(v: AgentVoiceEngine) => saveDict({ ...ds, agentEngine: v }, 'agent')} />
+            </div>
+            {#if ds.agentEngine === 'gemini-live'}
+              {#if !$geminiLiveState.ready}
+                <p class="hint"><Icon name="info" size={13} /> {$geminiLiveState.readinessError ?? 'Set up your Gemini API key and accept the Gemini notice in Settings ? AI above.'}</p>
+              {/if}
+              <div class="field">
+                <div class="lab"><strong>Gemini Live model</strong><span class="faint">Model used for live bidirectional voice chat.</span></div>
+                <select
+                  class="select"
+                  aria-label="Gemini Live model"
+                  value={ds.geminiLiveModel}
+                  onchange={(e) => saveDict({ ...ds, geminiLiveModel: (e.currentTarget as HTMLSelectElement).value }, 'agent')}>
+                  {#each $geminiLiveCatalog.models as m (m.id)}
+                    <option value={m.id}>{m.label}</option>
+                  {/each}
+                </select>
+              </div>
+              <div class="field">
+                <div class="lab"><strong>Gemini Live voice</strong><span class="faint">Prebuilt voice for Gemini responses.</span></div>
+                <select
+                  class="select"
+                  aria-label="Gemini Live voice"
+                  value={ds.geminiLiveVoice}
+                  onchange={(e) => saveDict({ ...ds, geminiLiveVoice: (e.currentTarget as HTMLSelectElement).value }, 'agent')}>
+                  {#each $geminiLiveCatalog.voices as v (v)}
+                    <option value={v}>{v}</option>
+                  {/each}
+                </select>
+              </div>
+              <div class="field col">
+                <div class="lab"><strong>Gemini Live instructions</strong><span class="faint">Optional persona or language guidance (up to 2000 characters).</span></div>
+                <textarea
+                  class="input area"
+                  rows="2"
+                  maxlength="2000"
+                  placeholder="Optional: e.g. Reply concisely in Persian unless I speak English."
+                  value={ds.geminiLiveSystemPrompt}
+                  onchange={(e) => saveDict({ ...ds, geminiLiveSystemPrompt: (e.currentTarget as HTMLTextAreaElement).value }, 'agent')}></textarea>
+              </div>
+            {:else if ds.agentEnabled && !modelReady}
               <p class="hint"><Icon name="download" size={13} /> Download a speech model below to talk to Agent.</p>
             {/if}
             <div class="field">
