@@ -13,12 +13,11 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::json;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_global_shortcut::ShortcutState;
 
 use krovi_net::ai::Provider;
 use krovi_net::gemini_live::{
-    build_audio_chunk_json, build_audio_end_json, build_client_text_json, build_setup_json,
     normalize_live_model, normalize_live_voice, pcm16_samples_to_le_bytes, LiveModelOption,
     LIVE_MODELS, LIVE_VOICES,
 };
@@ -28,15 +27,23 @@ use crate::ai::keys;
 use crate::commands::CmdResult;
 use crate::dictation::{agent_live_config, Dictation, TalkMode};
 
-const MIC_POLL: Duration = Duration::from_millis(50);
+const MIC_POLL: Duration = Duration::from_millis(40);
 const LEVEL_EMIT_EVERY: Duration = Duration::from_millis(100);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+const THINKING_TIMEOUT: Duration = Duration::from_secs(10);
+const GEN_COMPLETE_GRACE: Duration = Duration::from_millis(600);
+const HOLD_RELEASE_TAIL: Duration = Duration::from_millis(320);
+const MIN_HOLD_SAMPLES: usize = 3_200; // 200 ms at 16 kHz
+const SPEAKING_SAFETY_GRACE: Duration = Duration::from_millis(1_800);
+const SPEAKING_MIN_CHUNK_QUIET: Duration = Duration::from_millis(250);
 const MAX_PENDING_AUDIO_CHUNKS: usize = 120;
 
 #[derive(Debug)]
 enum LiveCmd {
     AudioPcm(Vec<u8>),
     AudioEnd,
+    CancelTurn,
+    OutputPlaybackChanged(bool),
     ClientText(String),
     Stop,
 }
@@ -46,7 +53,10 @@ struct SessionHandle {
     gen_id: u64,
     tx: Sender<LiveCmd>,
     mic_open: Arc<AtomicBool>,
+    output_playing: Arc<AtomicBool>,
+    mic_gen: Arc<AtomicU64>,
     stop_mic: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    tail_abort: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     model: String,
     voice: String,
     phase: Arc<Mutex<String>>,
@@ -133,12 +143,20 @@ fn stop_active_mic(handle: &SessionHandle) {
     }
 }
 
+fn abort_hold_tail(handle: &SessionHandle) {
+    if let Some(flag) = lk(&handle.tail_abort).take() {
+        flag.store(true, Ordering::SeqCst);
+    }
+}
+
 fn clear_if_current(app: &AppHandle, gen_id: u64, model: &str, voice: &str) {
     let live = app.state::<GeminiLive>();
     let mut slot = lk(&live.active);
     let matches = slot.as_ref().is_some_and(|h| h.gen_id == gen_id);
     if matches {
         if let Some(h) = slot.take() {
+            h.output_playing.store(false, Ordering::SeqCst);
+            abort_hold_tail(&h);
             stop_active_mic(&h);
         }
         drop(slot);
@@ -180,11 +198,15 @@ fn ensure_session(app: &AppHandle) -> Result<(SessionHandle, Option<String>), (S
     let gen_id = live.next_gen.fetch_add(1, Ordering::SeqCst);
     let (tx, rx) = mpsc::channel::<LiveCmd>();
     let mic_open = Arc::new(AtomicBool::new(false));
+    let output_playing = Arc::new(AtomicBool::new(false));
     let handle = SessionHandle {
         gen_id,
         tx,
         mic_open: mic_open.clone(),
+        output_playing: output_playing.clone(),
+        mic_gen: Arc::new(AtomicU64::new(0)),
         stop_mic: Arc::new(Mutex::new(None)),
+        tail_abort: Arc::new(Mutex::new(None)),
         model: model.clone(),
         voice: voice.clone(),
         phase: Arc::new(Mutex::new("connecting".into())),
@@ -198,7 +220,17 @@ fn ensure_session(app: &AppHandle) -> Result<(SessionHandle, Option<String>), (S
     thread::Builder::new()
         .name("krovi-gemini-live-ws".into())
         .spawn(move || {
-            run_ws_worker(app2, gen_id, rx, mic_open, api_key, m2, v2, system_prompt);
+            run_ws_worker(
+                app2,
+                gen_id,
+                rx,
+                mic_open,
+                output_playing,
+                api_key,
+                m2,
+                v2,
+                system_prompt,
+            );
         })
         .map_err(|e| {
             clear_if_current(app, gen_id, &model, &voice);
@@ -218,14 +250,21 @@ fn spawn_mic_pump(
     device: Option<String>,
     send_end_on_release: bool,
 ) {
+    abort_hold_tail(handle);
     stop_active_mic(handle);
+    let my_mic_gen = handle.mic_gen.fetch_add(1, Ordering::SeqCst) + 1;
     let stop_flag = Arc::new(AtomicBool::new(false));
+    let tail_abort = Arc::new(AtomicBool::new(false));
     *lk(&handle.stop_mic) = Some(stop_flag.clone());
+    *lk(&handle.tail_abort) = Some(tail_abort.clone());
 
     let app2 = app.clone();
     let tx = handle.tx.clone();
     let mic_open = handle.mic_open.clone();
+    let output_playing = handle.output_playing.clone();
+    let mic_gen_ref = handle.mic_gen.clone();
     let stop_mic_slot = handle.stop_mic.clone();
+    let tail_abort_slot = handle.tail_abort.clone();
     let gen_id = handle.gen_id;
     let model = handle.model.clone();
     let voice = handle.voice.clone();
@@ -236,60 +275,151 @@ fn spawn_mic_pump(
             let rec = match Recorder::start(device) {
                 Ok(r) => r,
                 Err(e) => {
-                    *lk(&stop_mic_slot) = None;
+                    if mic_gen_ref.load(Ordering::SeqCst) == my_mic_gen {
+                        *lk(&stop_mic_slot) = None;
+                        *lk(&tail_abort_slot) = None;
+                    }
                     emit_error(&app2, "mic", e);
                     return;
                 }
             };
 
-            if stop_flag.load(Ordering::SeqCst) {
-                *lk(&stop_mic_slot) = None;
+            if stop_flag.load(Ordering::SeqCst) || mic_gen_ref.load(Ordering::SeqCst) != my_mic_gen
+            {
+                if mic_gen_ref.load(Ordering::SeqCst) == my_mic_gen {
+                    *lk(&stop_mic_slot) = None;
+                    *lk(&tail_abort_slot) = None;
+                }
                 rec.cancel();
+                let still_same = lk(&app2.state::<GeminiLive>().active)
+                    .as_ref()
+                    .is_some_and(|h| h.gen_id == gen_id);
+                if still_same
+                    && send_end_on_release
+                    && !tail_abort.load(Ordering::SeqCst)
+                    && mic_gen_ref.load(Ordering::SeqCst) == my_mic_gen
+                {
+                    let _ = tx.send(LiveCmd::CancelTurn);
+                    emit_error(
+                        &app2,
+                        "nothing-heard",
+                        "Hold the shortcut while speaking (or switch to Toggle in Settings).",
+                    );
+                }
                 return;
             }
 
             mic_open.store(true, Ordering::SeqCst);
-            emit_state(&app2, "listening", Some(0.0), true, &model, &voice);
+            if !output_playing.load(Ordering::SeqCst) {
+                emit_state(&app2, "listening", Some(0.0), true, &model, &voice);
+            }
             let mut last_level_emit = Instant::now();
+            let mut was_muted = output_playing.load(Ordering::SeqCst);
+            let mut total_samples: usize = 0;
 
             while !stop_flag.load(Ordering::SeqCst) {
-                if rec.finished() {
+                if rec.finished() || mic_gen_ref.load(Ordering::SeqCst) != my_mic_gen {
                     break;
                 }
                 let samples = rec.drain_pcm16();
-                if !samples.is_empty() {
-                    let bytes = pcm16_samples_to_le_bytes(&samples);
-                    if tx.send(LiveCmd::AudioPcm(bytes)).is_err() {
-                        break;
+                if output_playing.load(Ordering::SeqCst) {
+                    // Discard speaker echo while Gemini is speaking so it cannot self-interrupt.
+                    was_muted = true;
+                } else {
+                    if was_muted {
+                        was_muted = false;
+                        last_level_emit = Instant::now();
+                        emit_state(&app2, "listening", Some(rec.level()), true, &model, &voice);
                     }
-                }
-                if last_level_emit.elapsed() >= LEVEL_EMIT_EVERY {
-                    last_level_emit = Instant::now();
-                    emit_state(&app2, "listening", Some(rec.level()), true, &model, &voice);
+                    if !samples.is_empty() {
+                        total_samples = total_samples.saturating_add(samples.len());
+                        let bytes = pcm16_samples_to_le_bytes(&samples);
+                        if tx.send(LiveCmd::AudioPcm(bytes)).is_err() {
+                            break;
+                        }
+                    }
+                    if last_level_emit.elapsed() >= LEVEL_EMIT_EVERY {
+                        last_level_emit = Instant::now();
+                        emit_state(&app2, "listening", Some(rec.level()), true, &model, &voice);
+                    }
                 }
                 thread::sleep(MIC_POLL);
             }
 
-            // Flush any tail samples before closing the microphone.
-            let tail = rec.drain_pcm16();
-            if !tail.is_empty() {
-                let bytes = pcm16_samples_to_le_bytes(&tail);
-                let _ = tx.send(LiveCmd::AudioPcm(bytes));
+            if mic_gen_ref.load(Ordering::SeqCst) == my_mic_gen {
+                mic_open.store(false, Ordering::SeqCst);
+                *lk(&stop_mic_slot) = None;
             }
-            drop(rec);
-            mic_open.store(false, Ordering::SeqCst);
-            *lk(&stop_mic_slot) = None;
 
-            let still_same = lk(&app2.state::<GeminiLive>().active)
-                .as_ref()
-                .is_some_and(|h| h.gen_id == gen_id);
-            if still_same && send_end_on_release {
-                let _ = tx.send(LiveCmd::AudioEnd);
+            let still_same = || {
+                lk(&app2.state::<GeminiLive>().active)
+                    .as_ref()
+                    .is_some_and(|h| h.gen_id == gen_id)
+                    && mic_gen_ref.load(Ordering::SeqCst) == my_mic_gen
+            };
+
+            if send_end_on_release && !tail_abort.load(Ordering::SeqCst) && still_same() {
+                if total_samples < MIN_HOLD_SAMPLES {
+                    drop(rec);
+                    if mic_gen_ref.load(Ordering::SeqCst) == my_mic_gen {
+                        *lk(&tail_abort_slot) = None;
+                    }
+                    let _ = tx.send(LiveCmd::CancelTurn);
+                    emit_error(
+                        &app2,
+                        "nothing-heard",
+                        "Hold the shortcut while speaking (or switch to Toggle in Settings).",
+                    );
+                    return;
+                }
+
+                // Update UI immediately while letting WASAPI capture a brief natural tail so the
+                // final syllable and server-side automatic VAD endpointing are not clipped.
                 emit_state(&app2, "thinking", None, true, &model, &voice);
+                let tail_until = Instant::now() + HOLD_RELEASE_TAIL;
+                while Instant::now() < tail_until
+                    && !tail_abort.load(Ordering::SeqCst)
+                    && !rec.finished()
+                    && mic_gen_ref.load(Ordering::SeqCst) == my_mic_gen
+                {
+                    let tail = rec.drain_pcm16();
+                    if !tail.is_empty() && !output_playing.load(Ordering::SeqCst) {
+                        let bytes = pcm16_samples_to_le_bytes(&tail);
+                        if tx.send(LiveCmd::AudioPcm(bytes)).is_err() {
+                            break;
+                        }
+                    }
+                    thread::sleep(MIC_POLL);
+                }
+
+                let final_tail = rec.drain_pcm16();
+                if !final_tail.is_empty()
+                    && !tail_abort.load(Ordering::SeqCst)
+                    && !output_playing.load(Ordering::SeqCst)
+                {
+                    let bytes = pcm16_samples_to_le_bytes(&final_tail);
+                    let _ = tx.send(LiveCmd::AudioPcm(bytes));
+                }
+                drop(rec);
+                if mic_gen_ref.load(Ordering::SeqCst) == my_mic_gen {
+                    *lk(&tail_abort_slot) = None;
+                }
+                if !tail_abort.load(Ordering::SeqCst) && still_same() {
+                    let _ = tx.send(LiveCmd::AudioEnd);
+                }
+            } else {
+                drop(rec);
+                if mic_gen_ref.load(Ordering::SeqCst) == my_mic_gen {
+                    *lk(&tail_abort_slot) = None;
+                }
             }
         });
 
     if let Err(e) = spawned {
+        if handle.mic_gen.load(Ordering::SeqCst) == my_mic_gen {
+            *lk(&handle.stop_mic) = None;
+            *lk(&handle.tail_abort) = None;
+        }
         emit_error(
             app,
             "mic",
@@ -305,13 +435,17 @@ fn run_ws_worker(
     gen_id: u64,
     rx: mpsc::Receiver<LiveCmd>,
     mic_open: Arc<AtomicBool>,
+    output_playing: Arc<AtomicBool>,
     api_key: String,
     model: String,
     voice: String,
     system_prompt: String,
 ) {
     use krovi_net::gemini_live::ws::{LivePollError, LiveSocket};
-    use krovi_net::gemini_live::LiveServerEvent;
+    use krovi_net::gemini_live::{
+        build_audio_chunk_json, build_audio_end_json, build_client_text_json, build_setup_json,
+        estimate_pcm_duration_ms, LiveServerEvent,
+    };
 
     let setup_json = build_setup_json(&model, &voice, Some(&system_prompt));
     let mut ws = match LiveSocket::connect(&api_key, &setup_json) {
@@ -328,7 +462,20 @@ fn run_ws_worker(
     let mut pending_end = false;
     let mut pending_texts: Vec<String> = Vec::new();
     let mut turn_has_output_transcript = false;
+    let mut turn_has_audio = false;
     let mut last_activity = Instant::now();
+    let mut thinking_since: Option<Instant> = None;
+    let mut gen_complete_without_audio_since: Option<Instant> = None;
+    let mut output_playing_deadline: Option<Instant> = None;
+    let mut last_audio_chunk_at: Option<Instant> = None;
+
+    let idle_phase = |mic: &AtomicBool| {
+        if mic.load(Ordering::SeqCst) {
+            "listening"
+        } else {
+            "ready"
+        }
+    };
 
     loop {
         let mut did_work = false;
@@ -338,6 +485,8 @@ fn run_ws_worker(
             last_activity = Instant::now();
             match cmd {
                 LiveCmd::AudioPcm(bytes) => {
+                    thinking_since = None;
+                    gen_complete_without_audio_since = None;
                     if setup_done {
                         let payload = build_audio_chunk_json(&bytes);
                         if let Err(e) = ws.send_text(&payload) {
@@ -358,8 +507,40 @@ fn run_ws_worker(
                             clear_if_current(&app, gen_id, &model, &voice);
                             return;
                         }
+                        thinking_since = Some(Instant::now());
+                        turn_has_audio = false;
+                        gen_complete_without_audio_since = None;
+                        emit_state(&app, "thinking", None, true, &model, &voice);
                     } else {
                         pending_end = true;
+                        thinking_since = Some(Instant::now());
+                    }
+                }
+                LiveCmd::CancelTurn => {
+                    pending_end = false;
+                    thinking_since = None;
+                    gen_complete_without_audio_since = None;
+                    if setup_done && !output_playing.load(Ordering::SeqCst) {
+                        emit_state(&app, idle_phase(&mic_open), None, true, &model, &voice);
+                    }
+                }
+                LiveCmd::OutputPlaybackChanged(playing) => {
+                    if playing {
+                        output_playing.store(true, Ordering::SeqCst);
+                        let min_deadline = Instant::now() + Duration::from_millis(500);
+                        if output_playing_deadline.is_none_or(|d| d < min_deadline) {
+                            output_playing_deadline = Some(min_deadline);
+                        }
+                    } else {
+                        let chunk_just_arrived = last_audio_chunk_at
+                            .is_some_and(|t| t.elapsed() < SPEAKING_MIN_CHUNK_QUIET);
+                        if !chunk_just_arrived {
+                            let was = output_playing.swap(false, Ordering::SeqCst);
+                            output_playing_deadline = None;
+                            if was && setup_done && thinking_since.is_none() {
+                                emit_state(&app, idle_phase(&mic_open), None, true, &model, &voice);
+                            }
+                        }
                     }
                 }
                 LiveCmd::ClientText(text) => {
@@ -371,11 +552,17 @@ fn run_ws_worker(
                             clear_if_current(&app, gen_id, &model, &voice);
                             return;
                         }
+                        thinking_since = Some(Instant::now());
+                        turn_has_audio = false;
+                        gen_complete_without_audio_since = None;
+                        emit_state(&app, "thinking", None, true, &model, &voice);
                     } else {
                         pending_texts.push(text);
+                        thinking_since = Some(Instant::now());
                     }
                 }
                 LiveCmd::Stop => {
+                    output_playing.store(false, Ordering::SeqCst);
                     ws.close();
                     clear_if_current(&app, gen_id, &model, &voice);
                     return;
@@ -402,6 +589,7 @@ fn run_ws_worker(
                                     return;
                                 }
                             }
+                            let mut sent_turn_end = false;
                             if pending_end {
                                 pending_end = false;
                                 if let Err(e) = ws.send_text(build_audio_end_json()) {
@@ -410,6 +598,7 @@ fn run_ws_worker(
                                     clear_if_current(&app, gen_id, &model, &voice);
                                     return;
                                 }
+                                sent_turn_end = true;
                             }
                             for text in pending_texts.drain(..) {
                                 let payload = build_client_text_json(&text);
@@ -419,13 +608,18 @@ fn run_ws_worker(
                                     clear_if_current(&app, gen_id, &model, &voice);
                                     return;
                                 }
+                                sent_turn_end = true;
                             }
-                            let phase = if mic_open.load(Ordering::SeqCst) {
-                                "listening"
+                            if sent_turn_end {
+                                thinking_since = Some(Instant::now());
+                                turn_has_audio = false;
+                                gen_complete_without_audio_since = None;
+                                emit_state(&app, "thinking", None, true, &model, &voice);
+                            } else if thinking_since.is_some() {
+                                emit_state(&app, "thinking", None, true, &model, &voice);
                             } else {
-                                "ready"
-                            };
-                            emit_state(&app, phase, None, true, &model, &voice);
+                                emit_state(&app, idle_phase(&mic_open), None, true, &model, &voice);
+                            }
                         }
                         LiveServerEvent::InputTranscript { text } => {
                             let _ = app.emit(
@@ -434,6 +628,8 @@ fn run_ws_worker(
                             );
                         }
                         LiveServerEvent::OutputTranscript { text } => {
+                            thinking_since = None;
+                            gen_complete_without_audio_since = None;
                             turn_has_output_transcript = true;
                             let _ = app.emit(
                                 "gemini-live-transcript",
@@ -441,6 +637,8 @@ fn run_ws_worker(
                             );
                         }
                         LiveServerEvent::OutputText { text } => {
+                            thinking_since = None;
+                            gen_complete_without_audio_since = None;
                             if !turn_has_output_transcript {
                                 let _ = app.emit(
                                     "gemini-live-transcript",
@@ -452,33 +650,48 @@ fn run_ws_worker(
                             base64,
                             sample_rate,
                         } => {
+                            thinking_since = None;
+                            gen_complete_without_audio_since = None;
+                            turn_has_audio = true;
+                            let now = Instant::now();
+                            last_audio_chunk_at = Some(now);
+                            output_playing.store(true, Ordering::SeqCst);
+                            let dur_ms = estimate_pcm_duration_ms(&base64, sample_rate).max(40);
+                            let base = output_playing_deadline.filter(|&d| d > now).unwrap_or(now);
+                            output_playing_deadline = Some(base + Duration::from_millis(dur_ms));
                             emit_state(&app, "speaking", None, true, &model, &voice);
                             let _ = app.emit(
                                 "gemini-live-audio",
                                 json!({ "data": base64, "sampleRate": sample_rate }),
                             );
                         }
+                        LiveServerEvent::GenerationComplete => {
+                            if thinking_since.is_some() && !turn_has_audio {
+                                gen_complete_without_audio_since = Some(Instant::now());
+                            }
+                        }
                         LiveServerEvent::Interrupted => {
+                            thinking_since = None;
+                            gen_complete_without_audio_since = None;
+                            turn_has_audio = false;
                             turn_has_output_transcript = false;
+                            output_playing.store(false, Ordering::SeqCst);
+                            output_playing_deadline = None;
                             let _ = app.emit("gemini-live-interrupted", json!({}));
-                            let phase = if mic_open.load(Ordering::SeqCst) {
-                                "listening"
-                            } else {
-                                "ready"
-                            };
-                            emit_state(&app, phase, None, true, &model, &voice);
+                            emit_state(&app, idle_phase(&mic_open), None, true, &model, &voice);
                         }
                         LiveServerEvent::TurnComplete => {
+                            thinking_since = None;
+                            gen_complete_without_audio_since = None;
+                            turn_has_audio = false;
                             turn_has_output_transcript = false;
                             let _ = app.emit("gemini-live-turn-complete", json!({}));
-                            let phase = if mic_open.load(Ordering::SeqCst) {
-                                "listening"
-                            } else {
-                                "ready"
-                            };
-                            emit_state(&app, phase, None, true, &model, &voice);
+                            if !output_playing.load(Ordering::SeqCst) {
+                                emit_state(&app, idle_phase(&mic_open), None, true, &model, &voice);
+                            }
                         }
                         LiveServerEvent::GoAway { .. } => {
+                            output_playing.store(false, Ordering::SeqCst);
                             emit_error(
                                 &app,
                                 "other",
@@ -489,6 +702,7 @@ fn run_ws_worker(
                             return;
                         }
                         LiveServerEvent::Error { message } => {
+                            output_playing.store(false, Ordering::SeqCst);
                             emit_error(&app, "other", message);
                             ws.close();
                             clear_if_current(&app, gen_id, &model, &voice);
@@ -508,7 +722,53 @@ fn run_ws_worker(
             }
         }
 
-        if !mic_open.load(Ordering::SeqCst) && last_activity.elapsed() > IDLE_TIMEOUT {
+        // Safety net: unmute if the webview never reported WebAudio playback completion.
+        if output_playing.load(Ordering::SeqCst)
+            && output_playing_deadline.is_some_and(|d| Instant::now() > d + SPEAKING_SAFETY_GRACE)
+        {
+            output_playing.store(false, Ordering::SeqCst);
+            output_playing_deadline = None;
+            if setup_done && thinking_since.is_none() {
+                emit_state(&app, idle_phase(&mic_open), None, true, &model, &voice);
+            }
+        }
+
+        // Exit "thinking" cleanly if generationComplete arrived without audio or turnComplete.
+        if thinking_since.is_some()
+            && gen_complete_without_audio_since.is_some_and(|t| t.elapsed() >= GEN_COMPLETE_GRACE)
+        {
+            thinking_since = None;
+            gen_complete_without_audio_since = None;
+            turn_has_audio = false;
+            turn_has_output_transcript = false;
+            let _ = app.emit("gemini-live-turn-complete", json!({}));
+            if !output_playing.load(Ordering::SeqCst) {
+                emit_state(&app, idle_phase(&mic_open), None, true, &model, &voice);
+            }
+        }
+
+        // Never leave the pill stuck on "Gemini thinking" if the server stayed silent.
+        if thinking_since.is_some_and(|t| t.elapsed() >= THINKING_TIMEOUT)
+            && !output_playing.load(Ordering::SeqCst)
+        {
+            thinking_since = None;
+            gen_complete_without_audio_since = None;
+            turn_has_audio = false;
+            turn_has_output_transcript = false;
+            let _ = app.emit("gemini-live-turn-complete", json!({}));
+            emit_state(&app, idle_phase(&mic_open), None, true, &model, &voice);
+            emit_error(
+                &app,
+                "nothing-heard",
+                "Gemini didn't reply. Hold the shortcut slightly longer while speaking.",
+            );
+        }
+
+        if !mic_open.load(Ordering::SeqCst)
+            && !output_playing.load(Ordering::SeqCst)
+            && thinking_since.is_none()
+            && last_activity.elapsed() > IDLE_TIMEOUT
+        {
             ws.close();
             clear_if_current(&app, gen_id, &model, &voice);
             return;
@@ -527,6 +787,7 @@ fn run_ws_worker(
     gen_id: u64,
     _rx: mpsc::Receiver<LiveCmd>,
     _mic_open: Arc<AtomicBool>,
+    _output_playing: Arc<AtomicBool>,
     _api_key: String,
     model: String,
     voice: String,
@@ -550,6 +811,12 @@ pub fn on_shortcut(app: &AppHandle, state: ShortcutState, talk_mode: TalkMode) {
                 .is_some_and(|h| h.mic_open.load(Ordering::SeqCst) || lk(&h.stop_mic).is_some())
             {
                 return; // OS key repeat while held
+            }
+            if let Some(ref h) = active {
+                abort_hold_tail(h);
+                if h.output_playing.swap(false, Ordering::SeqCst) {
+                    let _ = h.tx.send(LiveCmd::OutputPlaybackChanged(false));
+                }
             }
             let _ = app.emit("gemini-live-interrupted", json!({}));
             match ensure_session(app) {
@@ -579,6 +846,8 @@ pub fn on_shortcut(app: &AppHandle, state: ShortcutState, talk_mode: TalkMode) {
 pub fn stop_session(app: &AppHandle) {
     let handle = lk(&app.state::<GeminiLive>().active).take();
     if let Some(h) = handle {
+        h.output_playing.store(false, Ordering::SeqCst);
+        abort_hold_tail(&h);
         stop_active_mic(&h);
         let _ = h.tx.send(LiveCmd::Stop);
         let _ = app.emit("gemini-live-interrupted", json!({}));
@@ -680,4 +949,13 @@ pub fn gemini_live_send_text(app: AppHandle, text: String) -> CmdResult<()> {
         .tx
         .send(LiveCmd::ClientText(trimmed.to_string()))
         .map_err(|_| "Gemini Live session closed.".to_string())
+}
+
+/// Inform Rust when WebAudio starts or finishes speaking Gemini's reply so mic capture stays
+/// muted until speaker playback completes and cannot echo back into Gemini.
+#[tauri::command]
+pub fn gemini_live_set_output_playing(app: AppHandle, playing: bool) {
+    if let Some(h) = lk(&app.state::<GeminiLive>().active).clone() {
+        let _ = h.tx.send(LiveCmd::OutputPlaybackChanged(playing));
+    }
 }

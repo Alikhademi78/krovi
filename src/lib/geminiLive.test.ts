@@ -74,6 +74,13 @@ describe('geminiLive pure helpers and non-Tauri guards', () => {
       label: 'Gemini Live',
       detail: 'Invalid API key',
     });
+    expect(g.geminiPillFace({ ...base, phase: 'listening', sessionActive: true, error: 'Hold shortcut', errorTone: 'info' })).toEqual({
+      kind: 'notice',
+      tone: 'info',
+      label: 'Gemini Live',
+      detail: 'Hold shortcut',
+    });
+
   });
 
   it('rejects live commands in non-Tauri browser mode', async () => {
@@ -179,11 +186,11 @@ describe('geminiLive Tauri event wiring and commands', () => {
       voice: 'Kore',
     });
 
-    emit('gemini-live-transcript', { role: 'user', text: '\u0633\u0644\u0627\u0645 ' });
-    emit('gemini-live-transcript', { role: 'user', text: '\u06a9\u0648\u0631\u062a\u06a9\u0633' });
+    emit('gemini-live-transcript', { role: 'user', text: 'سلام ' });
+    emit('gemini-live-transcript', { role: 'user', text: 'کورتکس' });
     let turns = get(g.geminiLiveTurns);
     expect(turns).toHaveLength(1);
-    expect(turns[0]).toMatchObject({ role: 'user', text: '\u0633\u0644\u0627\u0645 \u06a9\u0648\u0631\u062a\u06a9\u0633', complete: false });
+    expect(turns[0]).toMatchObject({ role: 'user', text: 'سلام کورتکس', complete: false });
 
     emit('gemini-live-transcript', { role: 'model', text: 'Hello ' });
     emit('gemini-live-transcript', { role: 'model', text: 'Cortex!' });
@@ -209,5 +216,56 @@ describe('geminiLive Tauri event wiring and commands', () => {
 
     g.clearGeminiLiveTurns();
     expect(get(g.geminiLiveTurns)).toEqual([]);
+  });
+
+  it('notifies Rust when WebAudio playback starts and unmutes after echo guard delay', async () => {
+    const sources: { onended: (() => void) | null; stop: ReturnType<typeof vi.fn>; start: ReturnType<typeof vi.fn> }[] = [];
+    class MockAudioContext {
+      state = 'running';
+      currentTime = 0;
+      destination = {};
+      resume = vi.fn(async () => {});
+      createBuffer(_ch: number, len: number, sampleRate: number) {
+        return {
+          duration: len / sampleRate,
+          getChannelData: () => new Float32Array(len),
+        };
+      }
+      createBufferSource() {
+        const s = {
+          buffer: null as unknown,
+          connect: vi.fn(),
+          start: vi.fn(),
+          stop: vi.fn(),
+          onended: null as (() => void) | null,
+        };
+        sources.push(s);
+        return s;
+      }
+    }
+    vi.stubGlobal('window', { AudioContext: MockAudioContext });
+    try {
+      const g = await import('./geminiLive');
+      await g.wireGeminiLive();
+
+      const b64 = encodePcm16ToBase64(new Array(2400).fill(1000)); // 100 ms at 24 kHz
+      handlers.get('gemini-live-audio')?.({ data: b64, sampleRate: 24000 });
+
+      expect(calls).toContainEqual({ cmd: 'gemini_live_set_output_playing', args: { playing: true } });
+      expect(sources).toHaveLength(1);
+
+      // Even after onended, mic remains muted during the 350ms acoustic echo guard.
+      sources[0].onended?.();
+      expect(calls.filter((c) => c.cmd === 'gemini_live_set_output_playing')).toHaveLength(1);
+
+      vi.advanceTimersByTime(360);
+      expect(calls).toContainEqual({ cmd: 'gemini_live_set_output_playing', args: { playing: false } });
+
+      // Nothing-heard notices render with soft info tone.
+      handlers.get('gemini-live-error')?.({ kind: 'nothing-heard', message: 'Hold shortcut while speaking' });
+      expect(get(g.geminiLiveState)).toMatchObject({ error: 'Hold shortcut while speaking', errorTone: 'info' });
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

@@ -27,6 +27,7 @@ export interface GeminiLiveState {
   ready: boolean;
   readinessError: string | null;
   error: string | null;
+  errorTone?: 'error' | 'info';
 }
 
 export interface GeminiLiveTurn {
@@ -64,6 +65,7 @@ export const geminiLiveState = writable<GeminiLiveState>({
   ready: false,
   readinessError: null,
   error: null,
+  errorTone: 'error',
 });
 
 export const geminiLiveTurns = writable<GeminiLiveTurn[]>([]);
@@ -77,9 +79,37 @@ export const geminiLiveCatalog = writable<GeminiLiveCatalog>({
 // Audio playback (24 kHz mono PCM16 LE -> Web Audio API)
 // ---------------------------------------------------------------------------------------------
 
+const ECHO_GUARD_MS = 350;
+
 let audioCtx: AudioContext | null = null;
 let nextPlayTime = 0;
 const activeSources = new Set<AudioBufferSourceNode>();
+let lastReportedPlaying = false;
+let unmuteTimer: ReturnType<typeof setTimeout> | null = null;
+
+function clearUnmuteTimer(): void {
+  if (unmuteTimer) {
+    clearTimeout(unmuteTimer);
+    unmuteTimer = null;
+  }
+}
+
+function notifyOutputPlaying(playing: boolean): void {
+  if (lastReportedPlaying === playing) return;
+  lastReportedPlaying = playing;
+  if (!isTauri()) return;
+  void invoke('gemini_live_set_output_playing', { playing }).catch(() => {});
+}
+
+function scheduleOutputIdleCheck(): void {
+  clearUnmuteTimer();
+  unmuteTimer = setTimeout(() => {
+    unmuteTimer = null;
+    if (activeSources.size === 0) {
+      notifyOutputPlaying(false);
+    }
+  }, ECHO_GUARD_MS);
+}
 
 function ensureAudioContext(): AudioContext | null {
   if (typeof window === 'undefined') return null;
@@ -96,6 +126,7 @@ function ensureAudioContext(): AudioContext | null {
 }
 
 export function stopGeminiAudioPlayback(): void {
+  clearUnmuteTimer();
   for (const src of activeSources) {
     try {
       src.stop();
@@ -105,6 +136,7 @@ export function stopGeminiAudioPlayback(): void {
   }
   activeSources.clear();
   nextPlayTime = 0;
+  notifyOutputPlaying(false);
 }
 
 export function decodePcm16Base64ToFloat32(base64: string): Float32Array {
@@ -144,9 +176,14 @@ function playPcmChunk(base64: string, sampleRate: number): void {
   const startAt = Math.max(now + 0.015, nextPlayTime);
   nextPlayTime = startAt + buf.duration;
 
+  clearUnmuteTimer();
+  notifyOutputPlaying(true);
   activeSources.add(src);
   src.onended = () => {
     activeSources.delete(src);
+    if (activeSources.size === 0) {
+      scheduleOutputIdleCheck();
+    }
   };
   src.start(startAt);
 }
@@ -159,7 +196,7 @@ export function geminiPillFace(st: GeminiLiveState): DictationFace | null {
   if (st.error) {
     return {
       kind: 'notice',
-      tone: 'error',
+      tone: st.errorTone ?? 'error',
       label: 'Gemini Live',
       detail: st.error,
     };
@@ -252,6 +289,7 @@ export function wireGeminiLive(): Promise<void> {
         const raw = typeof p?.state === 'string' ? p.state : 'idle';
         const phase: GeminiLivePhase = VALID_PHASES.has(raw as GeminiLivePhase) ? (raw as GeminiLivePhase) : 'idle';
         const sessionActive = Boolean(p?.sessionActive);
+        if (!sessionActive || phase === 'idle') stopGeminiAudioPlayback();
         if (sessionActive && phase !== 'idle') clearErrorTimer();
         geminiLiveState.update((s) => ({
           ...s,
@@ -280,12 +318,16 @@ export function wireGeminiLive(): Promise<void> {
       }),
       listen<unknown>('gemini-live-turn-complete', () => {
         finalizeTurns();
+        if (activeSources.size === 0 && !unmuteTimer) {
+          scheduleOutputIdleCheck();
+        }
       }),
       listen<ErrorEvent>('gemini-live-error', (p) => {
         const msg = (p?.message ?? '').trim() || 'Gemini Live connection failed.';
-        stopGeminiAudioPlayback();
+        const tone: 'error' | 'info' = p?.kind === 'nothing-heard' ? 'info' : 'error';
+        if (tone === 'error') stopGeminiAudioPlayback();
         clearErrorTimer();
-        geminiLiveState.update((s) => ({ ...s, error: msg }));
+        geminiLiveState.update((s) => ({ ...s, error: msg, errorTone: tone }));
         errorTimer = setTimeout(() => {
           geminiLiveState.update((s) => (s.error === msg ? { ...s, error: null } : s));
         }, 5500);

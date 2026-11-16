@@ -177,6 +177,30 @@ pub fn build_client_text_json(text: &str) -> String {
     .to_string()
 }
 
+/// Estimate playback duration in milliseconds for a base64-encoded mono PCM16 chunk.
+pub fn estimate_pcm_duration_ms(base64: &str, sample_rate: u32) -> u64 {
+    let trimmed = base64.trim();
+    let len = trimmed.len();
+    if len == 0 {
+        return 0;
+    }
+    let pad = trimmed
+        .as_bytes()
+        .iter()
+        .rev()
+        .take(2)
+        .filter(|&&b| b == b'=')
+        .count();
+    let decoded_bytes = (len / 4).saturating_mul(3).saturating_sub(pad);
+    let samples = (decoded_bytes / 2) as u64;
+    let rate = if (8_000..=96_000).contains(&sample_rate) {
+        u64::from(sample_rate)
+    } else {
+        u64::from(DEFAULT_OUTPUT_SAMPLE_RATE)
+    };
+    samples.saturating_mul(1_000).saturating_add(rate - 1) / rate
+}
+
 /// Parse sample rate from MIME types like `audio/pcm;rate=24000`. Defaults to 24000 Hz.
 pub fn parse_pcm_sample_rate(mime: &str) -> u32 {
     for part in mime.split(';').skip(1) {
@@ -199,6 +223,7 @@ pub enum LiveServerEvent {
     OutputTranscript { text: String },
     OutputText { text: String },
     AudioChunk { base64: String, sample_rate: u32 },
+    GenerationComplete,
     Interrupted,
     TurnComplete,
     GoAway { time_left: Option<String> },
@@ -286,6 +311,14 @@ pub fn parse_server_message(raw: &str) -> Result<Vec<LiveServerEvent>, String> {
             events.push(LiveServerEvent::OutputTranscript {
                 text: t.to_string(),
             });
+        }
+
+        if sc
+            .get("generationComplete")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            events.push(LiveServerEvent::GenerationComplete);
         }
 
         if sc
@@ -523,10 +556,23 @@ mod tests {
             vec![LiveServerEvent::Interrupted]
         );
         assert_eq!(
+            parse_server_message(r#"{"serverContent":{"generationComplete":true}}"#).unwrap(),
+            vec![LiveServerEvent::GenerationComplete]
+        );
+        assert_eq!(
             parse_server_message(r#"{"error":{"message":"Quota exceeded"}}"#).unwrap(),
             vec![LiveServerEvent::Error {
                 message: "Quota exceeded".into()
             }]
         );
+    }
+
+    #[test]
+    fn estimates_pcm_chunk_playback_duration() {
+        // 48000 bytes = 24000 PCM16 samples = 1000 ms at 24 kHz
+        let raw = vec![0u8; 48_000];
+        let b64 = STANDARD.encode(raw);
+        assert_eq!(estimate_pcm_duration_ms(&b64, 24_000), 1000);
+        assert_eq!(estimate_pcm_duration_ms("", 24_000), 0);
     }
 }

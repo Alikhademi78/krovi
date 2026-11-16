@@ -132,6 +132,7 @@ pub fn run() {
             gemini_live::gemini_live_start,
             gemini_live::gemini_live_stop,
             gemini_live::gemini_live_send_text,
+            gemini_live::gemini_live_set_output_playing,
             // [live] — owner: live-data
             commands::load_clipboard,
             commands::add_clip,
