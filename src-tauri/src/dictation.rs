@@ -66,6 +66,16 @@ pub enum TalkMode {
     Toggle,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentVoiceEngine {
+    /// Real-time bidirectional voice conversation with Gemini Live.
+    #[default]
+    GeminiLive,
+    /// Offline Whisper transcription routed to the local Agent planner.
+    Local,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DictationSettings {
@@ -81,9 +91,13 @@ pub struct DictationSettings {
     /// Names / product terms that bias recognition.
     pub vocabulary: Vec<String>,
     pub options: DictationOptions,
-    /// Talk to Agent Mode: a second shortcut whose words go to the planner, never into an app.
+    /// Talk to Agent Mode: a second shortcut whose words go to Gemini Live or the local planner.
     pub agent_enabled: bool,
     pub agent_shortcut: String,
+    pub agent_engine: AgentVoiceEngine,
+    pub gemini_live_model: String,
+    pub gemini_live_voice: String,
+    pub gemini_live_system_prompt: String,
 }
 
 impl Default for DictationSettings {
@@ -99,8 +113,23 @@ impl Default for DictationSettings {
             options: DictationOptions::default(),
             agent_enabled: false,
             agent_shortcut: "Ctrl+Alt+A".into(),
+            agent_engine: AgentVoiceEngine::GeminiLive,
+            gemini_live_model: krovi_net::gemini_live::DEFAULT_LIVE_MODEL.into(),
+            gemini_live_voice: krovi_net::gemini_live::DEFAULT_LIVE_VOICE.into(),
+            gemini_live_system_prompt: String::new(),
         }
     }
+}
+
+/// Snapshot of mic device + Gemini Live configuration for `crate::gemini_live`.
+pub fn agent_live_config(d: &Dictation) -> (Option<String>, String, String, String) {
+    let s = lk(&d.settings);
+    (
+        s.device.clone(),
+        s.gemini_live_model.clone(),
+        s.gemini_live_voice.clone(),
+        s.gemini_live_system_prompt.clone(),
+    )
 }
 
 /// What a recording is for. Both shortcuts record the same way; only the destination differs
@@ -434,6 +463,7 @@ fn cancel_session(app: &AppHandle) {
         })
         .unwrap_or(SessionMode::Dictate);
     emit_state(app, "idle", mode);
+    crate::gemini_live::stop_session(app);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -443,12 +473,19 @@ fn cancel_session(app: &AppHandle) {
 /// Hold / toggle behaviour (the one setting both shortcuts share) for the shortcut that
 /// belongs to `mode`.
 fn on_shortcut(app: &AppHandle, state: ShortcutState, mode: SessionMode) {
-    let (talk, recording) = {
+    let (talk, agent_engine, recording) = {
         let d = app.state::<Dictation>();
-        let talk = lk(&d.settings).mode;
+        let s = lk(&d.settings);
+        let talk = s.mode;
+        let agent_engine = s.agent_engine;
+        drop(s);
         let recording = lk(&d.rec).as_ref().is_some_and(|(_, m)| *m == mode);
-        (talk, recording)
+        (talk, agent_engine, recording)
     };
+    if mode == SessionMode::Agent && agent_engine == AgentVoiceEngine::GeminiLive {
+        crate::gemini_live::on_shortcut(app, state, talk);
+        return;
+    }
     match (talk, state) {
         (TalkMode::Hold, ShortcutState::Pressed) => start(app, mode),
         (TalkMode::Hold, ShortcutState::Released) => finish(app, Some(mode)),
@@ -511,6 +548,9 @@ fn validate(s: &DictationSettings) -> Result<(), String> {
         ));
     }
     validate_replacements(&s.options.replacements)?;
+    if s.gemini_live_system_prompt.chars().count() > 2000 {
+        return Err("Gemini Live instructions must be 2000 characters or fewer.".into());
+    }
     let dictate_sc = crate::shell::parse_shortcut(&s.shortcut)?;
     let agent_sc = crate::shell::parse_shortcut(&s.agent_shortcut)?;
     if s.enabled && s.agent_enabled && dictate_sc == agent_sc {
@@ -575,6 +615,9 @@ pub fn dictation_set_settings(
     }
     setting_set(&state, KEY, &settings)?;
     *lk(&app.state::<Dictation>().settings) = settings.clone();
+    if !settings.agent_enabled || settings.agent_engine != AgentVoiceEngine::GeminiLive {
+        crate::gemini_live::stop_session(&app);
+    }
     Ok(settings)
 }
 
